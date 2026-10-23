@@ -258,7 +258,10 @@ const state = { fleet:[], revisions:[], alerts:[], watchdogs:[], dead:[], traffi
                 // GS_CTL_LIVE_V1. live[app_id] = [presence payloads], kept
                 // current by Realtime. liveErr explains an empty panel;
                 // liveOn stops a second boot opening a second connection.
-                live:{}, liveErr:'', liveOn:false, platformAppId:'' };
+                live:{}, liveErr:'', liveOn:false, platformAppId:'',
+                // GS_CTL_CODES_V1. Not persisted anywhere: the email is typed
+                // each time and the codes live only as long as the tab is open.
+                codes:{ email:'', rows:[], msg:'', err:'', busy:false, product:'', app:'' } };
 
 async function api(path, opts={}){
   const r = await fetch(store.base.replace(/\/$/,'') + '/api/controller/' + path, {
@@ -454,7 +457,7 @@ function renderShell(){
       <div class="bar">
         <h2>${app ? `<button id="crumb" class="btn quiet" style="padding:0;font-size:15px;color:var(--muted)">All activity</button><span style="color:var(--faint);margin:0 6px">/</span>${esc(app.name)}` : 'All activity'}</h2>
         <div class="tabs">
-          ${['changes','feed','infra','assist','traffic','flags','alerts','watchdogs','dead files'].map(t=>
+          ${['changes','feed','infra','assist','traffic','codes','flags','alerts','watchdogs','dead files'].map(t=>
             `<button class="tab" role="tab" data-tab="${t}" aria-selected="${state.tab===t}">${t}</button>`).join('')}
         </div>
         <div class="spacer"></div>
@@ -502,6 +505,7 @@ function renderView(){
   if (state.error){ v.innerHTML = `<div class="empty"><b>Could not load</b>${esc(state.error)}</div>`; return; }
   if (state.tab==='changes')   return renderChanges(v);
   if (state.tab==='traffic')   return renderTraffic(v);
+  if (state.tab==='codes')     return renderCodes(v);
   if (state.tab==='flags')     return renderFlags(v);
   if (state.tab==='feed')      return renderFeed(v);
   if (state.tab==='infra')     return renderInfra(v);
@@ -669,6 +673,128 @@ function renderTraffic(v){
         + pages.map(p=>`<tr><td class="mono">${esc(p.page)}</td>${sel?'':`<td>${esc(p.name||'')}</td>`}
             <td class="mono">${p.visits}</td><td class="mono">${p.unique_visitors}</td></tr>`).join('')
         + `</tbody></table></div>` : '');
+}
+
+// GS_CTL_CODES_V1. See the header of patch_controller_html_052.py.
+//
+// Everything here is one POST to /api/controller/license with an action.
+// Nothing is cached and nothing is logged - a code on screen is a code being
+// read out to a buyer, not a record to keep.
+async function codesDo(body){
+  state.codes.busy = true; state.codes.msg = ''; state.codes.err = ''; renderView();
+  try {
+    const r = await api('license', { method:'POST', body: JSON.stringify(body) });
+    state.codes.busy = false;
+    return r;
+  } catch(e) {
+    state.codes.busy = false;
+    state.codes.err = e && e.message || String(e);
+    renderView();
+    return null;
+  }
+}
+
+function renderCodes(v){
+  const c = state.codes;
+  // Delivered, failed, or issued before we started recording it. The third is
+  // genuinely unknown rather than fine, and says so.
+  const delivery = r => r.email_error
+      ? `<span class="chip" style="background:rgba(229,72,77,.15);color:var(--crit)">never sent</span>`
+      : r.emailed_at
+        ? `<span class="chip add">emailed ${esc(ago(r.emailed_at))}</span>`
+        : `<span class="chip">delivery unknown</span>`;
+
+  v.innerHTML = `
+    <div class="empty" style="padding:14px 12px;margin:0 0 20px">
+      <b>When a buyer did not get their code</b>
+      A 100%-off order used to attach the plan without issuing a code at all, and a
+      failed email left no trace. Both are fixed — this is for the ones that already
+      slipped through, and for any send that fails from here on.
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:18px">
+      <input id="cdmail" placeholder="buyer's email" value="${esc(c.email)}"
+             style="flex:1;min-width:240px;padding:8px 10px;background:var(--panel);border:1px solid var(--line);
+                    border-radius:8px;color:inherit;font:inherit">
+      <button class="btn" id="cdlook"${c.busy?' disabled':''}>${c.busy?'Working…':'Look up'}</button>
+    </div>`
+    + (c.err ? `<div class="alert crit" style="margin:0 0 18px"><div class="t">That did not work</div><div class="d">${esc(c.err)}</div></div>` : '')
+    + (c.msg ? `<div class="alert" style="margin:0 0 18px"><div class="d">${esc(c.msg)}</div></div>` : '')
+    + (c.rows.length
+        ? `<table><thead><tr><th>Code</th><th>Product</th><th>Email</th><th>Redeemed</th><th></th></tr></thead><tbody>`
+          + c.rows.map(r=>`<tr>
+              <td class="mono" style="font-size:14px;user-select:all">${esc(r.code)}${
+                r.revoked_at ? ` <span class="chip">revoked</span>` : ''}</td>
+              <td>${esc(r.product||'')}</td>
+              <td>${delivery(r)}</td>
+              <td>${r.claimed_by
+                    ? `<span class="chip add">yes, ${esc(ago(r.claimed_at))}</span>`
+                    : `<span class="chip">not yet</span>`}</td>
+              <td><button class="btn quiet" data-resend="${esc(r.code)}"${c.busy?' disabled':''}>Resend email</button></td>
+            </tr>`).join('')
+          + `</tbody></table>`
+        : (c.email && !c.busy
+            ? `<div class="empty"><b>No access code for ${esc(c.email)}</b>Either they never had one — which is what a
+               100%-off order did before the fix — or they bought under a different address. Issue one below.</div>`
+            : ''))
+    + `<div style="margin-top:26px;padding-top:20px;border-top:1px solid var(--line)">
+        <div style="font-size:13px;font-weight:500;margin-bottom:4px">Issue a code</div>
+        <div style="color:var(--faint);font-size:12px;margin-bottom:10px">
+          Reuses their existing code if there is one, so this cannot leave a buyer holding two.
+          The plan is found by its <span class="mono">platform_product</span>, not picked here.
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select id="cdapp" style="padding:8px 10px;background:var(--panel);border:1px solid var(--line);
+                                    border-radius:8px;color:inherit;font:inherit;min-width:200px">
+            <option value="">which app sells it…</option>
+            ${state.fleet.map(f=>`<option value="${esc(f.deployment_id)}"${
+              c.app===f.deployment_id?' selected':''}>${esc(f.name||f.deployment_id.slice(0,8))}</option>`).join('')}
+          </select>
+          <input id="cdprod" placeholder="platform_product, e.g. geniestack" value="${esc(c.product)}"
+                 style="min-width:240px;padding:8px 10px;background:var(--panel);border:1px solid var(--line);
+                        border-radius:8px;color:inherit;font:inherit">
+          <button class="btn" id="cdissue"${c.busy?' disabled':''}>Issue</button>
+        </div>
+      </div>`;
+
+  const mail = () => String(($('#cdmail')||{}).value||'').trim();
+  const look = async () => {
+    const email = mail();
+    if (!email) return;
+    state.codes.email = email;
+    const r = await codesDo({ action:'look', email });
+    if (!r) return;
+    state.codes.rows = (r.codes||[]);
+    renderView();
+  };
+  $('#cdlook').onclick = look;
+  $('#cdmail').onkeydown = e => { if (e.key === 'Enter') look(); };
+
+  v.querySelectorAll('[data-resend]').forEach(b => b.onclick = async () => {
+    const r = await codesDo({ action:'resend', email: state.codes.email, code: b.dataset.resend });
+    if (!r) return;
+    // The code comes back even when the send failed - that is the whole
+    // reason this exists, so there is always something to paste.
+    state.codes.msg = r.emailed
+      ? 'Emailed ' + r.code + ' to ' + r.email + '.'
+      : 'Email failed (' + (r.detail||'no reason given') + '). The code is ' + r.code + ' — send it to them yourself.';
+    await look();
+  });
+
+  $('#cdissue').onclick = async () => {
+    const email = mail();
+    const app = String(($('#cdapp')||{}).value||'');
+    const product = String(($('#cdprod')||{}).value||'').trim();
+    state.codes.email = email; state.codes.app = app; state.codes.product = product;
+    if (!email || !app || !product){
+      state.codes.err = 'Needs the buyer email, the app that sells it, and the platform_product.';
+      return renderView();
+    }
+    const r = await codesDo({ action:'issue', email, app_id: app, product });
+    if (!r) return;
+    state.codes.msg = (r.created ? 'Issued ' : 'They already had ') + r.code
+      + (r.emailed ? ' and emailed it.' : ' — the email did NOT send, so pass it on yourself.');
+    await look();
+  };
 }
 
 function renderFlags(v){
