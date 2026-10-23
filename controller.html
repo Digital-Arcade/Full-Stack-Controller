@@ -254,7 +254,11 @@ const store = {
 
 const state = { fleet:[], revisions:[], alerts:[], watchdogs:[], dead:[], traffic:[], pages:[], flags:null,
                 feed:[], feedRuns:[], hosts:[], findings:[], askFocus:null,
-                selected:null, tab:'changes', loading:false, error:'' };
+                selected:null, tab:'changes', loading:false, error:'',
+                // GS_CTL_LIVE_V1. live[app_id] = [presence payloads], kept
+                // current by Realtime. liveErr explains an empty panel;
+                // liveOn stops a second boot opening a second connection.
+                live:{}, liveErr:'', liveOn:false, platformAppId:'' };
 
 async function api(path, opts={}){
   const r = await fetch(store.base.replace(/\/$/,'') + '/api/controller/' + path, {
@@ -279,6 +283,87 @@ const ago = iso => {
   if (s<2592000) return Math.floor(s/86400)+'d ago';
   return new Date(iso).toLocaleDateString();
 };
+
+/* ------------------------------------------------------------- live visitors */
+// GS_CTL_LIVE_V1. See the header of patch_controller_html_051.py.
+//
+// One Realtime connection, one channel per app, read-only. The payload keys
+// are the shells' own (visitor_id, page, member_email, member_name,
+// deployment_id, online_at, country, countryName, region, city), so the
+// platform and a tenant app render through the same code.
+const GS_LIVE_MAX = 60;
+
+async function startLive(){
+  if (state.liveOn) return;
+  state.liveOn = true;
+  try {
+    const cfg = await api('realtime-config');
+    if (!cfg || !cfg.url || !cfg.anonKey) throw new Error('the worker returned no realtime config');
+    state.platformAppId = cfg.platformAppId || '';
+
+    // Dynamic, and inside the try: a console that cannot reach a CDN must
+    // still open. Pinned exactly - "@2" would silently change under us.
+    const { createClient } = await import('https://esm.sh/@supabase/supabase-js@2.45.4');
+    const sb = createClient(cfg.url, cfg.anonKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+      realtime: { params: { eventsPerSecond: 2 } }
+    });
+
+    // The platform first - those are the clients who pay - then the fleet,
+    // newest change first, which is the order the sidebar already uses.
+    const ids = [];
+    if (state.platformAppId) ids.push(state.platformAppId);
+    state.fleet.forEach(f => { if (f.deployment_id && ids.indexOf(f.deployment_id) === -1) ids.push(f.deployment_id); });
+    const use = ids.slice(0, GS_LIVE_MAX);
+    if (ids.length > use.length) {
+      state.liveErr = 'Showing the first ' + GS_LIVE_MAX + ' of ' + ids.length + ' apps.';
+    }
+
+    let pending = null;
+    const repaint = () => {
+      // Presence fires sync, join and leave separately; a tab switch of one
+      // visitor is three events. Coalesced so the table is not rebuilt
+      // several times for one person moving.
+      if (pending) return;
+      pending = setTimeout(() => { pending = null; if (state.tab === 'traffic') renderView(); }, 250);
+    };
+
+    use.forEach(id => {
+      const ch = sb.channel('presence:' + id);
+      const read = () => {
+        try {
+          const st = ch.presenceState() || {};
+          const out = [];
+          Object.keys(st).forEach(k => {
+            const metas = st[k] || [];
+            const m = metas[metas.length - 1];
+            if (m) out.push(m);
+          });
+          state.live[id] = out;
+        } catch(e) { state.live[id] = []; }
+        repaint();
+      };
+      ch.on('presence', { event: 'sync' },  read)
+        .on('presence', { event: 'join' },  read)
+        .on('presence', { event: 'leave' }, read)
+        // Subscribe only. track() would put the operator in his own numbers
+        // and in every tenant's admin dashboard as a visitor.
+        .subscribe();
+    });
+  } catch(e) {
+    state.liveOn = false;
+    state.liveErr = e && e.message || String(e);
+    console.warn('[controller] live visitors unavailable:', state.liveErr);
+    if (state.tab === 'traffic') renderView();
+  }
+}
+
+// Everyone currently on, flattened, with the app they are on attached.
+function liveRows(){
+  const out = [];
+  Object.keys(state.live).forEach(id => (state.live[id] || []).forEach(m => out.push({ app_id: id, ...m })));
+  return out.sort((a,b) => String(b.online_at||'').localeCompare(String(a.online_at||'')));
+}
 
 /* ------------------------------------------------------- sign in / set up */
 // Which screen to show depends on whether an account exists yet. Asking the
@@ -519,17 +604,55 @@ function renderChanges(v){
 function renderTraffic(v){
   const sel = state.selected;
   const rows = sel ? state.traffic.filter(t=>t.app_id===sel) : state.traffic;
+  // GS_CTL_LIVE_V1. Right now, above the 30-day history. Rendered before the
+  // "no traffic recorded" return below, because an app with no history can
+  // still have somebody in it this second - and that is the more urgent fact.
+  const live = liveRows().filter(r => !sel || r.app_id === sel);
+  const liveName = id => id && id === state.platformAppId
+    ? 'GenieStack (platform)'
+    : (state.fleet.find(f=>f.deployment_id===id)||{}).name || String(id||'').slice(0,8);
+  const onFor = iso => {
+    if (!iso) return '';
+    const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+    return s < 60 ? Math.floor(s) + 's' : s < 3600 ? Math.floor(s/60) + 'm' : Math.floor(s/3600) + 'h';
+  };
+  const liveBlock = `<div style="margin-bottom:26px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <i class="dot ${live.length ? 'sig' : ''}"></i>
+        <div style="font-size:13px;font-weight:500">Live right now</div>
+        <span class="mono" style="color:var(--faint)">${live.length}</span>
+      </div>`
+    + (live.length
+        ? `<table><thead><tr><th>Who</th>${sel?'':'<th>App</th>'}<th>Page</th><th>In</th><th>Where</th><th>On for</th></tr></thead><tbody>`
+          + live.map(r=>`<tr>
+              <td>${esc(r.member_email || r.member_name || '')
+                    || `<span style="color:var(--faint)">signed out · ${esc(String(r.visitor_id||'').slice(0,8))}</span>`}</td>
+              ${sel?'':`<td>${esc(liveName(r.app_id))}</td>`}
+              <td class="mono">${esc(r.page||'')}</td>
+              <td class="mono">${r.deployment_id ? esc(liveName(r.deployment_id)) : '—'}</td>
+              <td>${esc([r.city, r.countryName || r.country].filter(Boolean).join(', ')) || '—'}</td>
+              <td class="mono">${onFor(r.online_at)}</td>
+            </tr>`).join('')
+          + `</tbody></table>`
+        : `<div class="empty" style="padding:14px 10px">${
+             state.liveErr
+               ? `<b>Live view unavailable</b>${esc(state.liveErr)}`
+               : `<b>Nobody on right now</b>This updates by itself as people arrive and leave. A client in the builder shows the app they have open in the <b>In</b> column.`
+           }</div>`)
+    + (state.liveErr && live.length ? `<div style="color:var(--faint);font-size:12px;margin-top:6px">${esc(state.liveErr)}</div>` : '')
+    + `</div>`;
+
   if (!rows.length){
-    v.innerHTML = `<div class="empty"><b>No traffic recorded</b>Page views land in <code>site_visits</code> from the GenieShell shim, one row per module view, deduped per minute and skipped in the editor. An app with none here has either had no visitors or is running a shell built before the shim was added.</div>`;
+    v.innerHTML = liveBlock + `<div class="empty"><b>No traffic recorded</b>Page views land in <code>site_visits</code> from the GenieShell shim, one row per module view, deduped per minute and skipped in the editor. An app with none here has either had no visitors or is running a shell built before the shim was added. The platform's own rows come from the shim in <code>App.tsx</code>.</div>`;
     return;
   }
   const max = Math.max(...rows.map(r=>Number(r.visits)));
   const pages = state.pages.filter(p=>!sel || p.app_id===sel).slice(0,12);
-  v.innerHTML = `<table><thead><tr>
+  v.innerHTML = liveBlock + `<table><thead><tr>
       <th>App</th><th>Visits (30d)</th><th>Unique</th><th>Members</th>
       <th>Countries</th><th>24h</th><th>7d</th><th>Last seen</th></tr></thead><tbody>`
     + rows.map(r=>`<tr>
-        <td>${esc(r.name||String(r.app_id).slice(0,8))}</td>
+        <td>${esc(r.name || liveName(r.app_id))}</td>
         <td><div style="display:flex;align-items:center;gap:8px">
           <div style="height:6px;border-radius:3px;background:var(--signal);width:${Math.max(4,Math.round(Number(r.visits)/max*90))}px"></div>
           <span class="mono">${r.visits}</span></div></td>
@@ -1652,6 +1775,10 @@ async function boot(refresh){
       .then(([traffic, pages]) => { state.traffic = traffic; state.pages = pages;
                                     if (state.tab === 'traffic') renderView(); })
       .catch(() => {});
+    // GS_CTL_LIVE_V1. After the fleet is in state, because the channel list
+    // comes from it. Not awaited: a Realtime connection that cannot be made
+    // must not hold up the console, and startLive repaints on its own.
+    startLive();
   }catch(e){
     if (e.message === 'unauthorized') return;
     state.error = e.message;
